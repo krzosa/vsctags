@@ -514,18 +514,26 @@ class CtagsHoverProvider implements vscode.HoverProvider {
 }
 
 class CtagsWorkspaceSymbolProvider implements vscode.WorkspaceSymbolProvider {
-  provideWorkspaceSymbols(query: string, _token: vscode.CancellationToken): vscode.SymbolInformation[] {
+  public async provideWorkspaceSymbols(query: string, token: vscode.CancellationToken): Promise<vscode.SymbolInformation[]> {
     const t = performance.now();
     const limit = 200;
     const lowerQuery = query.toLowerCase().trim();
 
-    if (lowerQuery.length === 0) {
+    if (!lowerQuery) {
       return [];
+    }
+
+    if (token.isCancellationRequested) {
+      throw new vscode.CancellationError();
     }
 
     try {
       // Fast prefix search via binary search — O(log n + k), synchronous
       const results = prefixSearch(db, lowerQuery, limit);
+
+      if (token.isCancellationRequested) {``
+        throw new vscode.CancellationError();
+      }
 
       const symbols = results.map(entry =>
         new vscode.SymbolInformation(
@@ -536,19 +544,32 @@ class CtagsWorkspaceSymbolProvider implements vscode.WorkspaceSymbolProvider {
         ),
       );
 
-      logInfo(`Workspace symbol search: "${query}" -> ${symbols.length} result(s) in ${formatDuration(performance.now() - t)}`);
+      if (symbols.length > 0) {
+        const s = symbols[0];
+        logInfo(`Workspace symbol search: "${query}" -> ${symbols.length} result(s) in ${formatDuration(performance.now() - t)}, sample: uri=${s.location.uri.toString()}, scheme=${s.location.uri.scheme}, line=${s.location.range.start.line}`);
+      } else {
+        logInfo(`Workspace symbol search: "${query}" -> 0 result(s) in ${formatDuration(performance.now() - t)}`);
+      }
       return symbols;
     } catch (err) {
+      if (err instanceof vscode.CancellationError) {
+        logInfo(`Workspace symbol search cancelled for "${query}" after ${formatDuration(performance.now() - t)}`);
+        throw err;
+      }
       logError(`Workspace symbol search failed for "${query}": ${err}`);
       return [];
     }
   }
 
   async resolveWorkspaceSymbol(symbol: vscode.SymbolInformation): Promise<vscode.SymbolInformation | undefined> {
+    const t = performance.now();
     // Resolve the exact line number when the user selects a symbol
     const relPath = vscode.workspace.asRelativePath(symbol.location.uri, false);
     const entries = db.nameIndex.get(symbol.name);
-    if (!entries) { return symbol; }
+    if (!entries) {
+      logInfo(`resolveWorkspaceSymbol: "${symbol.name}" no entries, ${formatDuration(performance.now() - t)}`);
+      return symbol;
+    }
 
     const match = entries.find(e => e.file === relPath);
     if (match) {
@@ -557,6 +578,7 @@ class CtagsWorkspaceSymbolProvider implements vscode.WorkspaceSymbolProvider {
       }
       symbol.location = entryToLocation(match);
     }
+    logInfo(`resolveWorkspaceSymbol: "${symbol.name}" in ${formatDuration(performance.now() - t)}`);
     return symbol;
   }
 }
