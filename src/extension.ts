@@ -50,9 +50,14 @@ function extractSearchText(pattern: string): string {
  * Parse a ctags file using streaming readline.
  * Avoids loading the entire file into memory as a single string.
  */
-function streamParseCtagsFile(tagsPath: string): Promise<CtagsEntry[]> {
+function streamParseCtagsFile(
+  tagsPath: string,
+  onProgress?: (count: number) => void,
+): Promise<CtagsEntry[]> {
   return new Promise((resolve, reject) => {
     const entries: CtagsEntry[] = [];
+    let progressCounter = 0;
+    const progressInterval = 50000; // report every 50K entries
     const rl = readline.createInterface({
       input: createReadStream(tagsPath, { encoding: "utf-8" }),
       crlfDelay: Infinity,
@@ -118,9 +123,17 @@ function streamParseCtagsFile(tagsPath: string): Promise<CtagsEntry[]> {
         lineNumber,
         scope,
       });
+
+      progressCounter++;
+      if (onProgress && progressCounter % progressInterval === 0) {
+        onProgress(progressCounter);
+      }
     });
 
-    rl.on("close", () => resolve(entries));
+    rl.on("close", () => {
+      if (onProgress) { onProgress(entries.length); }
+      resolve(entries);
+    });
     rl.on("error", (err: Error) => reject(err));
   });
 }
@@ -376,7 +389,7 @@ function updateStatusBar() {
   statusBarItem.show();
 }
 
-async function loadTags(): Promise<boolean> {
+async function loadTags(progress?: vscode.Progress<{ message?: string; increment?: number }>): Promise<boolean> {
   if (!wsRoot) { return false; }
   if (isLoading) {
     logInfo("Load already in progress, skipping.");
@@ -395,13 +408,19 @@ async function loadTags(): Promise<boolean> {
     const t1 = performance.now();
 
     let fileSizeKB = "?";
+    let fileSizeBytes = 0;
     try {
       const stat = await fs.stat(tagsPath);
-      fileSizeKB = (stat.size / 1024).toFixed(1);
+      fileSizeBytes = stat.size;
+      fileSizeKB = (fileSizeBytes / 1024).toFixed(1);
       logInfo(`  File size: ${fileSizeKB} KB`);
     } catch { /* stat failed, continue anyway */ }
 
-    const entries = await streamParseCtagsFile(tagsPath);
+    const entries = await streamParseCtagsFile(tagsPath, (count) => {
+      const msg = `Parsing tags... ${(count / 1000).toFixed(0)}K entries`;
+      statusBarItem.text = `$(sync~spin) vsctags: ${(count / 1000).toFixed(0)}K`;
+      if (progress) { progress.report({ message: msg }); }
+    });
     const parseTime = performance.now() - t1;
     const withLineNum = entries.filter(e => e.lineNumber >= 0).length;
     const needsResolve = entries.length - withLineNum;
@@ -410,6 +429,8 @@ async function loadTags(): Promise<boolean> {
 
     // Stage 2: Build indexes (name, file, sorted)
     logInfo("Stage 2/3: Building indexes...");
+    if (progress) { progress.report({ message: `Building index for ${entries.length} tags...` }); }
+    statusBarItem.text = `$(sync~spin) vsctags: indexing...`;
     const t2 = performance.now();
     const newDb = buildDatabase(entries);
     const indexTime = performance.now() - t2;
@@ -612,10 +633,10 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Initial load with progress
   vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Window, title: "vsctags: Loading tags..." },
+    { location: vscode.ProgressLocation.Window, title: "vsctags" },
     async (progress) => {
-      progress.report({ message: "Reading tags file..." });
-      const ok = await loadTags();
+      progress.report({ message: "Loading tags..." });
+      const ok = await loadTags(progress);
       if (ok) {
         progress.report({ message: `Loaded ${db.entries.length} tags` });
       }
@@ -665,7 +686,7 @@ export function activate(context: vscode.ExtensionContext) {
       logInfo("Manual reload requested.");
       const ok = await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: "vsctags: Reloading tags..." },
-        async () => loadTags(),
+        async (progress) => loadTags(progress),
       );
       if (ok) {
         vscode.window.showInformationMessage(`[vsctags] Reloaded ${db.entries.length} tags.`);
