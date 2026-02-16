@@ -1,6 +1,8 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import * as fs from "fs/promises";
+import { createReadStream } from "fs";
+import * as readline from "readline";
 
 // ---- Output Channel for observability ----
 let log: vscode.OutputChannel;
@@ -15,66 +17,20 @@ function logError(msg: string) {
   log.appendLine(`[${ts}] ERROR: ${msg}`);
 }
 
-/** A single parsed ctags entry */
+// ---- Data structures ----
+
+/**
+ * Lightweight ctags entry. Uses direct properties instead of Map
+ * to save ~200 bytes per entry at scale.
+ */
 interface CtagsEntry {
   name: string;
+  nameLower: string;  // pre-cached lowercase for fast search
   file: string;
   pattern: string;
   kind: string;
-  lineNumber: number;
-  fields: Map<string, string>;
-}
-
-/** Parse raw tag lines into entries (without resolving pattern line numbers) */
-function parseCtagsLines(content: string): CtagsEntry[] {
-  const entries: CtagsEntry[] = [];
-  const lines = content.split("\n");
-  for (const line of lines) {
-    if (line.startsWith("!_TAG_") || line.trim() === "") {
-      continue;
-    }
-    const firstTab = line.indexOf("\t");
-    if (firstTab === -1) { continue; }
-    const secondTab = line.indexOf("\t", firstTab + 1);
-    if (secondTab === -1) { continue; }
-
-    const name = line.substring(0, firstTab);
-    const file = line.substring(firstTab + 1, secondTab);
-    const rest = line.substring(secondTab + 1);
-
-    let pattern = "";
-    let kind = "";
-    let lineNumber = -1; // -1 means "needs resolution"
-    const fields = new Map<string, string>();
-
-    const exCmdEnd = rest.indexOf(';"');
-    if (exCmdEnd !== -1) {
-      pattern = rest.substring(0, exCmdEnd);
-      const afterExCmd = rest.substring(exCmdEnd + 2);
-      const parts = afterExCmd.split("\t").filter((s) => s.length > 0);
-      if (parts.length > 0) { kind = parts[0]; }
-      for (let i = 1; i < parts.length; i++) {
-        const colon = parts[i].indexOf(":");
-        if (colon !== -1) {
-          fields.set(parts[i].substring(0, colon), parts[i].substring(colon + 1));
-        }
-      }
-    } else {
-      pattern = rest;
-    }
-
-    // Resolve line number from fields or numeric pattern
-    const lineField = fields.get("line");
-    if (lineField) {
-      lineNumber = Math.max(0, parseInt(lineField, 10) - 1);
-    } else if (/^\d+$/.test(pattern.trim())) {
-      lineNumber = Math.max(0, parseInt(pattern.trim(), 10) - 1);
-    }
-    // otherwise lineNumber stays -1 => needs pattern resolution
-
-    entries.push({ name, file, pattern, kind, lineNumber, fields });
-  }
-  return entries;
+  lineNumber: number; // -1 = unresolved, resolved lazily on first access
+  scope: string;      // extracted from fields (scope or class)
 }
 
 /** Extract the search text from a ctags /^...$/ pattern */
@@ -88,81 +44,266 @@ function extractSearchText(pattern: string): string {
   return s;
 }
 
-/** Resolve pattern-based line numbers by reading source files (async, batched by file) */
-async function resolvePatternLineNumbers(entries: CtagsEntry[], workspaceRoot: string): Promise<number> {
-  // Group entries that need resolution by file
-  const byFile = new Map<string, CtagsEntry[]>();
-  let needsResolution = 0;
-  for (const entry of entries) {
-    if (entry.lineNumber === -1) {
-      needsResolution++;
-      let list = byFile.get(entry.file);
-      if (!list) { list = []; byFile.set(entry.file, list); }
-      list.push(entry);
-    }
-  }
+// ---- Streaming parser ----
 
-  if (needsResolution === 0) { return 0; }
+/**
+ * Parse a ctags file using streaming readline.
+ * Avoids loading the entire file into memory as a single string.
+ */
+function streamParseCtagsFile(tagsPath: string): Promise<CtagsEntry[]> {
+  return new Promise((resolve, reject) => {
+    const entries: CtagsEntry[] = [];
+    const rl = readline.createInterface({
+      input: createReadStream(tagsPath, { encoding: "utf-8" }),
+      crlfDelay: Infinity,
+    });
 
-  logInfo(`  Resolving ${needsResolution} pattern-based line numbers across ${byFile.size} files...`);
-  let resolved = 0;
-  let fileErrors = 0;
+    rl.on("line", (line: string) => {
+      if (line.startsWith("!_TAG_") || line.length === 0) {
+        return;
+      }
+      const firstTab = line.indexOf("\t");
+      if (firstTab === -1) { return; }
+      const secondTab = line.indexOf("\t", firstTab + 1);
+      if (secondTab === -1) { return; }
 
-  for (const [relFile, fileEntries] of byFile) {
-    const absPath = path.join(workspaceRoot, relFile);
-    try {
-      const fileContent = await fs.readFile(absPath, "utf-8");
-      const fileLines = fileContent.split("\n");
+      const name = line.substring(0, firstTab);
+      const file = line.substring(firstTab + 1, secondTab);
+      const rest = line.substring(secondTab + 1);
 
-      for (const entry of fileEntries) {
-        const searchText = extractSearchText(entry.pattern);
-        if (searchText.length === 0) {
-          entry.lineNumber = 0;
-          continue;
-        }
-        let found = false;
-        for (let i = 0; i < fileLines.length; i++) {
-          if (fileLines[i].includes(searchText)) {
-            entry.lineNumber = i;
-            resolved++;
-            found = true;
-            break;
+      let pattern = "";
+      let kind = "";
+      let lineNumber = -1;
+      let scope = "";
+      let lineField = "";
+
+      const exCmdEnd = rest.indexOf(';"');
+      if (exCmdEnd !== -1) {
+        pattern = rest.substring(0, exCmdEnd);
+        const afterExCmd = rest.substring(exCmdEnd + 2);
+        const parts = afterExCmd.split("\t");
+        for (let i = 0; i < parts.length; i++) {
+          const p = parts[i];
+          if (p.length === 0) { continue; }
+          if (i === 0 || (kind === "" && p.indexOf(":") === -1)) {
+            // First non-empty part after ;" that isn't a key:value is the kind
+            if (kind === "") { kind = p; continue; }
+          }
+          const colon = p.indexOf(":");
+          if (colon !== -1) {
+            const key = p.substring(0, colon);
+            const val = p.substring(colon + 1);
+            if (key === "line") { lineField = val; }
+            else if (key === "scope" || key === "class") { scope = val; }
           }
         }
-        if (!found) {
-          entry.lineNumber = 0; // fallback
-        }
+      } else {
+        pattern = rest;
       }
-    } catch {
-      fileErrors++;
-      for (const entry of fileEntries) {
-        entry.lineNumber = 0;
-      }
-    }
-  }
 
-  logInfo(`  Resolved ${resolved}/${needsResolution} patterns (${fileErrors} unreadable files)`);
-  return needsResolution;
+      // Resolve line number from field or numeric pattern
+      if (lineField) {
+        lineNumber = Math.max(0, parseInt(lineField, 10) - 1);
+      } else if (/^\d+$/.test(pattern)) {
+        lineNumber = Math.max(0, parseInt(pattern, 10) - 1);
+      }
+      // else stays -1 => lazy resolution
+
+      entries.push({
+        name,
+        nameLower: name.toLowerCase(),
+        file,
+        pattern,
+        kind,
+        lineNumber,
+        scope,
+      });
+    });
+
+    rl.on("close", () => resolve(entries));
+    rl.on("error", (err: Error) => reject(err));
+  });
 }
 
-type CtagsIndex = Map<string, CtagsEntry[]>;
+// ---- Indexes ----
 
-function buildIndex(entries: CtagsEntry[]): CtagsIndex {
-  const index: CtagsIndex = new Map();
+/** Name lookup: tag name -> entries */
+type NameIndex = Map<string, CtagsEntry[]>;
+
+/** File lookup: relative file path -> entries */
+type FileIndex = Map<string, CtagsEntry[]>;
+
+/**
+ * Sorted array of { nameLower, entry } for binary-search prefix matching.
+ * Sorted by nameLower.
+ */
+interface SortedSymbol {
+  nameLower: string;
+  entry: CtagsEntry;
+}
+
+interface TagDatabase {
+  entries: CtagsEntry[];
+  nameIndex: NameIndex;
+  fileIndex: FileIndex;
+  sorted: SortedSymbol[];
+}
+
+function buildDatabase(entries: CtagsEntry[]): TagDatabase {
+  const nameIndex: NameIndex = new Map();
+  const fileIndex: FileIndex = new Map();
+
   for (const entry of entries) {
-    let list = index.get(entry.name);
-    if (!list) {
-      list = [];
-      index.set(entry.name, list);
-    }
-    list.push(entry);
+    // Name index
+    let nameList = nameIndex.get(entry.name);
+    if (!nameList) { nameList = []; nameIndex.set(entry.name, nameList); }
+    nameList.push(entry);
+
+    // File index
+    let fileList = fileIndex.get(entry.file);
+    if (!fileList) { fileList = []; fileIndex.set(entry.file, fileList); }
+    fileList.push(entry);
   }
-  return index;
+
+  // Sorted array for binary-search prefix matching
+  const sorted: SortedSymbol[] = entries.map(e => ({ nameLower: e.nameLower, entry: e }));
+  sorted.sort((a, b) => {
+    if (a.nameLower < b.nameLower) { return -1; }
+    if (a.nameLower > b.nameLower) { return 1; }
+    return 0;
+  });
+
+  return { entries, nameIndex, fileIndex, sorted };
+}
+
+/**
+ * Binary search: find the first index in sorted[] where nameLower >= prefix.
+ */
+function lowerBound(sorted: SortedSymbol[], prefix: string): number {
+  let lo = 0;
+  let hi = sorted.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (sorted[mid].nameLower < prefix) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+/**
+ * Fast prefix search using binary search on sorted symbols.
+ * Returns up to `limit` entries whose name starts with `prefix`.
+ */
+function prefixSearch(db: TagDatabase, prefix: string, limit: number): CtagsEntry[] {
+  const results: CtagsEntry[] = [];
+  const start = lowerBound(db.sorted, prefix);
+  for (let i = start; i < db.sorted.length && results.length < limit; i++) {
+    if (db.sorted[i].nameLower.startsWith(prefix)) {
+      results.push(db.sorted[i].entry);
+    } else {
+      break; // sorted, so no more matches
+    }
+  }
+  return results;
+}
+
+/**
+ * Substring search fallback. Linear scan but uses pre-cached nameLower.
+ */
+function substringSearch(db: TagDatabase, query: string, limit: number): CtagsEntry[] {
+  const results: CtagsEntry[] = [];
+  for (const entry of db.entries) {
+    if (entry.nameLower.includes(query)) {
+      results.push(entry);
+      if (results.length >= limit) { break; }
+    }
+  }
+  return results;
+}
+
+// ---- Lazy line number resolution ----
+
+/** Cache of file contents for lazy resolution, keyed by absolute path */
+const fileContentCache = new Map<string, string[] | null>();
+
+async function getFileLines(absPath: string): Promise<string[] | null> {
+  const cached = fileContentCache.get(absPath);
+  if (cached !== undefined) { return cached; }
+  try {
+    const content = await fs.readFile(absPath, "utf-8");
+    const lines = content.split("\n");
+    fileContentCache.set(absPath, lines);
+    return lines;
+  } catch {
+    fileContentCache.set(absPath, null);
+    return null;
+  }
+}
+
+/**
+ * Resolve the line number of an entry lazily. If already resolved, returns immediately.
+ * Otherwise reads the source file (with caching) and finds the pattern.
+ */
+async function resolveLineNumber(entry: CtagsEntry, root: string): Promise<number> {
+  if (entry.lineNumber >= 0) { return entry.lineNumber; }
+
+  const searchText = extractSearchText(entry.pattern);
+  if (searchText.length === 0) {
+    entry.lineNumber = 0;
+    return 0;
+  }
+
+  const absPath = path.join(root, entry.file);
+  const lines = await getFileLines(absPath);
+  if (!lines) {
+    entry.lineNumber = 0;
+    return 0;
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].includes(searchText)) {
+      entry.lineNumber = i;
+      return i;
+    }
+  }
+  entry.lineNumber = 0;
+  return 0;
+}
+
+/**
+ * Resolve line numbers for a batch of entries.
+ * Groups by file to avoid redundant reads.
+ */
+async function resolveEntries(entries: CtagsEntry[], root: string): Promise<void> {
+  // Collect unique files that need resolution
+  const filesToResolve = new Set<string>();
+  for (const e of entries) {
+    if (e.lineNumber === -1) {
+      filesToResolve.add(e.file);
+    }
+  }
+  // Pre-load files in parallel (up to 20 at a time)
+  const files = Array.from(filesToResolve);
+  const batchSize = 20;
+  for (let i = 0; i < files.length; i += batchSize) {
+    const batch = files.slice(i, i + batchSize);
+    await Promise.all(batch.map(f => getFileLines(path.join(root, f))));
+  }
+  // Now resolve all entries (file contents are cached)
+  for (const e of entries) {
+    if (e.lineNumber === -1) {
+      await resolveLineNumber(e, root);
+    }
+  }
 }
 
 function entryToLocation(entry: CtagsEntry, root: string): vscode.Location {
+  const ln = entry.lineNumber >= 0 ? entry.lineNumber : 0;
   const uri = vscode.Uri.file(path.join(root, entry.file));
-  const pos = new vscode.Position(entry.lineNumber, 0);
+  const pos = new vscode.Position(ln, 0);
   return new vscode.Location(uri, pos);
 }
 
@@ -215,8 +356,7 @@ function formatDuration(ms: number): string {
 
 // ---- Extension State ----
 
-let allEntries: CtagsEntry[] = [];
-let tagIndex: CtagsIndex = new Map();
+let db: TagDatabase = { entries: [], nameIndex: new Map(), fileIndex: new Map(), sorted: [] };
 let wsRoot = "";
 let statusBarItem: vscode.StatusBarItem;
 let isLoading = false;
@@ -225,9 +365,9 @@ function updateStatusBar() {
   if (isLoading) {
     statusBarItem.text = "$(sync~spin) vsctags: loading...";
     statusBarItem.tooltip = "Loading tags file...";
-  } else if (allEntries.length > 0) {
-    statusBarItem.text = `$(tag) vsctags: ${allEntries.length}`;
-    statusBarItem.tooltip = `${allEntries.length} tags loaded\n${tagIndex.size} unique symbols\nClick to reload`;
+  } else if (db.entries.length > 0) {
+    statusBarItem.text = `$(tag) vsctags: ${db.entries.length}`;
+    statusBarItem.tooltip = `${db.entries.length} tags loaded\n${db.nameIndex.size} unique symbols\n${db.fileIndex.size} files\nClick to reload`;
   } else {
     statusBarItem.text = "$(tag) vsctags: no tags";
     statusBarItem.tooltip = "No tags file found. Click to reload.";
@@ -250,61 +390,58 @@ async function loadTags(): Promise<boolean> {
   const totalStart = performance.now();
 
   try {
-    // Stage 1: Read file
-    logInfo("Stage 1/4: Reading tags file...");
+    // Stage 1: Stream-parse the file
+    logInfo("Stage 1/3: Stream-parsing tags file...");
     const t1 = performance.now();
-    const content = await fs.readFile(tagsPath, "utf-8");
-    const fileSizeKB = (Buffer.byteLength(content, "utf-8") / 1024).toFixed(1);
-    const readTime = performance.now() - t1;
-    logInfo(`  Read ${fileSizeKB} KB in ${formatDuration(readTime)}`);
 
-    // Stage 2: Parse lines
-    logInfo("Stage 2/4: Parsing tag entries...");
-    const t2 = performance.now();
-    const entries = parseCtagsLines(content);
-    const parseTime = performance.now() - t2;
+    let fileSizeKB = "?";
+    try {
+      const stat = await fs.stat(tagsPath);
+      fileSizeKB = (stat.size / 1024).toFixed(1);
+      logInfo(`  File size: ${fileSizeKB} KB`);
+    } catch { /* stat failed, continue anyway */ }
+
+    const entries = await streamParseCtagsFile(tagsPath);
+    const parseTime = performance.now() - t1;
+    const withLineNum = entries.filter(e => e.lineNumber >= 0).length;
+    const needsResolve = entries.length - withLineNum;
     logInfo(`  Parsed ${entries.length} entries in ${formatDuration(parseTime)}`);
+    logInfo(`  ${withLineNum} with line numbers, ${needsResolve} need lazy resolution`);
 
-    // Stage 3: Resolve patterns
-    logInfo("Stage 3/4: Resolving pattern line numbers...");
-    const t3 = performance.now();
-    const patternsResolved = await resolvePatternLineNumbers(entries, wsRoot);
-    const resolveTime = performance.now() - t3;
-    if (patternsResolved > 0) {
-      logInfo(`  Pattern resolution took ${formatDuration(resolveTime)}`);
-    } else {
-      logInfo(`  No patterns to resolve (all entries have line numbers)`);
-    }
+    // Stage 2: Build indexes (name, file, sorted)
+    logInfo("Stage 2/3: Building indexes...");
+    const t2 = performance.now();
+    const newDb = buildDatabase(entries);
+    const indexTime = performance.now() - t2;
+    logInfo(`  Name index: ${newDb.nameIndex.size} unique symbols`);
+    logInfo(`  File index: ${newDb.fileIndex.size} files`);
+    logInfo(`  Sorted array: ${newDb.sorted.length} entries`);
+    logInfo(`  Index build took ${formatDuration(indexTime)}`);
 
-    // Stage 4: Build index
-    logInfo("Stage 4/4: Building symbol index...");
-    const t4 = performance.now();
-    const index = buildIndex(entries);
-    const indexTime = performance.now() - t4;
-    logInfo(`  Indexed ${index.size} unique symbols in ${formatDuration(indexTime)}`);
+    // Stage 3: Clear file content cache (stale data from previous load)
+    logInfo("Stage 3/3: Clearing resolution cache...");
+    fileContentCache.clear();
 
     // Commit
-    allEntries = entries;
-    tagIndex = index;
+    db = newDb;
 
     // Summary
     const totalTime = performance.now() - totalStart;
     const summary = [
       `--- Load complete ---`,
-      `  Tags: ${allEntries.length} entries, ${tagIndex.size} unique symbols`,
+      `  Tags: ${db.entries.length} entries, ${db.nameIndex.size} unique symbols, ${db.fileIndex.size} files`,
       `  File size: ${fileSizeKB} KB`,
+      `  Lazy resolution deferred for ${needsResolve} pattern-based entries`,
       `  Timings:`,
-      `    Read:    ${formatDuration(readTime)}`,
-      `    Parse:   ${formatDuration(parseTime)}`,
-      `    Resolve: ${formatDuration(resolveTime)}`,
-      `    Index:   ${formatDuration(indexTime)}`,
-      `    Total:   ${formatDuration(totalTime)}`,
+      `    Parse:  ${formatDuration(parseTime)}`,
+      `    Index:  ${formatDuration(indexTime)}`,
+      `    Total:  ${formatDuration(totalTime)}`,
     ].join("\n");
     logInfo(summary);
 
     // Collect kind stats
     const kindCounts = new Map<string, number>();
-    for (const entry of allEntries) {
+    for (const entry of db.entries) {
       const k = entry.kind || "(unknown)";
       kindCounts.set(k, (kindCounts.get(k) || 0) + 1);
     }
@@ -319,8 +456,7 @@ async function loadTags(): Promise<boolean> {
   } catch (err) {
     const totalTime = performance.now() - totalStart;
     logError(`Failed to load tags from ${tagsPath} after ${formatDuration(totalTime)}: ${err}`);
-    allEntries = [];
-    tagIndex = new Map();
+    db = { entries: [], nameIndex: new Map(), fileIndex: new Map(), sorted: [] };
     isLoading = false;
     updateStatusBar();
     return false;
@@ -330,36 +466,38 @@ async function loadTags(): Promise<boolean> {
 // ---- Providers ----
 
 class CtagsDefinitionProvider implements vscode.DefinitionProvider {
-  provideDefinition(
+  async provideDefinition(
     document: vscode.TextDocument,
     position: vscode.Position,
-  ): vscode.Location[] | undefined {
+  ): Promise<vscode.Location[] | undefined> {
     const word = getWordAtPosition(document, position);
     if (!word) { return undefined; }
-    const entries = tagIndex.get(word);
+    const entries = db.nameIndex.get(word);
     if (!entries || entries.length === 0) { return undefined; }
+    // Lazy-resolve line numbers before navigating
+    await resolveEntries(entries, wsRoot);
     logInfo(`Definition lookup: "${word}" -> ${entries.length} result(s)`);
     return entries.map((e) => entryToLocation(e, wsRoot));
   }
 }
 
 class CtagsHoverProvider implements vscode.HoverProvider {
-  provideHover(
+  async provideHover(
     document: vscode.TextDocument,
     position: vscode.Position,
-  ): vscode.Hover | undefined {
+  ): Promise<vscode.Hover | undefined> {
     const word = getWordAtPosition(document, position);
     if (!word) { return undefined; }
-    const entries = tagIndex.get(word);
+    const entries = db.nameIndex.get(word);
     if (!entries || entries.length === 0) { return undefined; }
+    await resolveEntries(entries, wsRoot);
 
     const lines: string[] = [];
     for (const entry of entries) {
       let label = `**${entry.name}**`;
       if (entry.kind) { label += ` _(${entry.kind})_`; }
       label += ` \u2014 ${entry.file}:${entry.lineNumber + 1}`;
-      const scope = entry.fields.get("scope") || entry.fields.get("class");
-      if (scope) { label += ` [${scope}]`; }
+      if (entry.scope) { label += ` [${entry.scope}]`; }
       lines.push(label);
     }
     return new vscode.Hover(new vscode.MarkdownString(lines.join("\n\n")));
@@ -369,25 +507,42 @@ class CtagsHoverProvider implements vscode.HoverProvider {
 class CtagsWorkspaceSymbolProvider implements vscode.WorkspaceSymbolProvider {
   provideWorkspaceSymbols(query: string): vscode.SymbolInformation[] {
     const t = performance.now();
-    const results: vscode.SymbolInformation[] = [];
+    const limit = 500;
     const lowerQuery = query.toLowerCase();
 
-    for (const entry of allEntries) {
-      if (lowerQuery && !entry.name.toLowerCase().includes(lowerQuery)) {
-        continue;
+    let results: CtagsEntry[];
+
+    if (lowerQuery.length === 0) {
+      // No query: return first N entries
+      results = db.entries.slice(0, limit);
+    } else {
+      // Try prefix search first (O(log n + k))
+      results = prefixSearch(db, lowerQuery, limit);
+
+      // If prefix didn't fill up, supplement with substring matches
+      if (results.length < limit) {
+        const prefixSet = new Set(results);
+        const substringResults = substringSearch(db, lowerQuery, limit);
+        for (const entry of substringResults) {
+          if (!prefixSet.has(entry)) {
+            results.push(entry);
+            if (results.length >= limit) { break; }
+          }
+        }
       }
-      results.push(
-        new vscode.SymbolInformation(
-          entry.name,
-          entryToSymbolKind(entry.kind),
-          entry.fields.get("scope") || entry.fields.get("class") || "",
-          entryToLocation(entry, wsRoot),
-        ),
-      );
-      if (results.length >= 500) { break; }
     }
-    logInfo(`Workspace symbol search: "${query}" -> ${results.length} result(s) in ${formatDuration(performance.now() - t)}`);
-    return results;
+
+    const symbols = results.map(entry =>
+      new vscode.SymbolInformation(
+        entry.name,
+        entryToSymbolKind(entry.kind),
+        entry.scope,
+        entryToLocation(entry, wsRoot),
+      ),
+    );
+
+    logInfo(`Workspace symbol search: "${query}" -> ${symbols.length} result(s) in ${formatDuration(performance.now() - t)}`);
+    return symbols;
   }
 }
 
@@ -397,34 +552,38 @@ class CtagsDocumentSymbolProvider implements vscode.DocumentSymbolProvider {
   ): vscode.SymbolInformation[] {
     const t = performance.now();
     const relPath = vscode.workspace.asRelativePath(document.uri, false);
-    const results: vscode.SymbolInformation[] = [];
 
-    for (const entry of allEntries) {
-      if (entry.file === relPath) {
-        results.push(
-          new vscode.SymbolInformation(
-            entry.name,
-            entryToSymbolKind(entry.kind),
-            entry.fields.get("scope") || entry.fields.get("class") || "",
-            entryToLocation(entry, wsRoot),
-          ),
-        );
-      }
+    // O(1) lookup via file index instead of scanning all entries
+    const fileEntries = db.fileIndex.get(relPath);
+    if (!fileEntries || fileEntries.length === 0) {
+      logInfo(`Document symbols: "${relPath}" -> 0 symbol(s) in ${formatDuration(performance.now() - t)}`);
+      return [];
     }
+
+    const results = fileEntries.map(entry =>
+      new vscode.SymbolInformation(
+        entry.name,
+        entryToSymbolKind(entry.kind),
+        entry.scope,
+        entryToLocation(entry, wsRoot),
+      ),
+    );
+
     logInfo(`Document symbols: "${relPath}" -> ${results.length} symbol(s) in ${formatDuration(performance.now() - t)}`);
     return results;
   }
 }
 
 class CtagsReferenceProvider implements vscode.ReferenceProvider {
-  provideReferences(
+  async provideReferences(
     document: vscode.TextDocument,
     position: vscode.Position,
-  ): vscode.Location[] | undefined {
+  ): Promise<vscode.Location[] | undefined> {
     const word = getWordAtPosition(document, position);
     if (!word) { return undefined; }
-    const entries = tagIndex.get(word);
+    const entries = db.nameIndex.get(word);
     if (!entries || entries.length === 0) { return undefined; }
+    await resolveEntries(entries, wsRoot);
     logInfo(`References lookup: "${word}" -> ${entries.length} result(s)`);
     return entries.map((e) => entryToLocation(e, wsRoot));
   }
@@ -458,7 +617,7 @@ export function activate(context: vscode.ExtensionContext) {
       progress.report({ message: "Reading tags file..." });
       const ok = await loadTags();
       if (ok) {
-        progress.report({ message: `Loaded ${allEntries.length} tags` });
+        progress.report({ message: `Loaded ${db.entries.length} tags` });
       }
     },
   );
@@ -482,17 +641,17 @@ export function activate(context: vscode.ExtensionContext) {
   watcher.onDidChange(async () => {
     logInfo("Tags file changed on disk. Reloading...");
     await loadTags();
-    vscode.window.showInformationMessage(`[vsctags] Reloaded ${allEntries.length} tags.`);
+    vscode.window.showInformationMessage(`[vsctags] Reloaded ${db.entries.length} tags.`);
   });
   watcher.onDidCreate(async () => {
     logInfo("Tags file created. Loading...");
     await loadTags();
-    vscode.window.showInformationMessage(`[vsctags] Loaded ${allEntries.length} tags.`);
+    vscode.window.showInformationMessage(`[vsctags] Loaded ${db.entries.length} tags.`);
   });
   watcher.onDidDelete(() => {
     logInfo("Tags file deleted.");
-    allEntries = [];
-    tagIndex = new Map();
+    db = { entries: [], nameIndex: new Map(), fileIndex: new Map(), sorted: [] };
+    fileContentCache.clear();
     updateStatusBar();
     vscode.window.showInformationMessage("[vsctags] Tags file removed.");
   });
@@ -509,7 +668,7 @@ export function activate(context: vscode.ExtensionContext) {
         async () => loadTags(),
       );
       if (ok) {
-        vscode.window.showInformationMessage(`[vsctags] Reloaded ${allEntries.length} tags.`);
+        vscode.window.showInformationMessage(`[vsctags] Reloaded ${db.entries.length} tags.`);
       } else {
         vscode.window.showWarningMessage("[vsctags] No tags file found.");
       }
@@ -528,4 +687,5 @@ export function activate(context: vscode.ExtensionContext) {
 
 export function deactivate() {
   logInfo("Extension deactivated.");
+  fileContentCache.clear();
 }
