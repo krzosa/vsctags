@@ -19,6 +19,10 @@
       {
         "command": "vsctags.reloadTags",
         "title": "vsctags: Reload Tags"
+      },
+      {
+        "command": "vsctags.showLog",
+        "title": "vsctags: Show Log"
       }
     ]
   },
