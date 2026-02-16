@@ -655,21 +655,28 @@ export function activate(context: vscode.ExtensionContext) {
   );
   logInfo("Language providers registered (definition, hover, workspace symbols, document symbols, references)");
 
-  // Watch the tags file for changes
+  // Watch the tags file for changes (debounced)
   const tagsPattern = new vscode.RelativePattern(folders[0], "tags");
   const watcher = vscode.workspace.createFileSystemWatcher(tagsPattern);
+  const debounceMs = 2000;
+  let debounceTimer: ReturnType<typeof setTimeout> | undefined;
 
-  watcher.onDidChange(async () => {
-    logInfo("Tags file changed on disk. Reloading...");
-    await loadTags();
-    vscode.window.showInformationMessage(`[vsctags] Reloaded ${db.entries.length} tags.`);
-  });
-  watcher.onDidCreate(async () => {
-    logInfo("Tags file created. Loading...");
-    await loadTags();
-    vscode.window.showInformationMessage(`[vsctags] Loaded ${db.entries.length} tags.`);
-  });
+  function debouncedReload(reason: string) {
+    if (debounceTimer) { clearTimeout(debounceTimer); }
+    logInfo(`Tags file ${reason}. Waiting ${debounceMs}ms for stability...`);
+    statusBarItem.text = "$(sync~spin) vsctags: file changed...";
+    debounceTimer = setTimeout(async () => {
+      debounceTimer = undefined;
+      logInfo("Debounce elapsed, reloading tags.");
+      await loadTags();
+      vscode.window.showInformationMessage(`[vsctags] Reloaded ${db.entries.length} tags.`);
+    }, debounceMs);
+  }
+
+  watcher.onDidChange(() => debouncedReload("changed"));
+  watcher.onDidCreate(() => debouncedReload("created"));
   watcher.onDidDelete(() => {
+    if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = undefined; }
     logInfo("Tags file deleted.");
     db = { entries: [], nameIndex: new Map(), fileIndex: new Map(), sorted: [] };
     fileContentCache.clear();
