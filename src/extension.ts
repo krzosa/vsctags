@@ -236,6 +236,20 @@ function substringSearch(db: TagDatabase, query: string, limit: number): CtagsEn
   return results;
 }
 
+// ---- URI cache ----
+
+/** Cache of file URIs to avoid redundant Uri.joinPath calls */
+let fileUriCache = new Map<string, vscode.Uri>();
+
+function getFileUri(relPath: string): vscode.Uri {
+  let uri = fileUriCache.get(relPath);
+  if (!uri) {
+    uri = vscode.Uri.joinPath(wsRootUri, relPath);
+    fileUriCache.set(relPath, uri);
+  }
+  return uri;
+}
+
 // ---- Lazy line number resolution ----
 
 /**
@@ -264,7 +278,7 @@ async function resolveLineNumber(entry: CtagsEntry, rootUri: vscode.Uri): Promis
     return 0;
   }
 
-  const doc = await getDocument(vscode.Uri.joinPath(rootUri, entry.file));
+  const doc = await getDocument(getFileUri(entry.file));
   if (!doc) {
     entry.lineNumber = 0;
     return 0;
@@ -291,11 +305,9 @@ async function resolveEntries(entries: CtagsEntry[], rootUri: vscode.Uri): Promi
   }
 }
 
-function entryToLocation(entry: CtagsEntry, rootUri: vscode.Uri): vscode.Location {
+function entryToLocation(entry: CtagsEntry): vscode.Location {
   const ln = entry.lineNumber >= 0 ? entry.lineNumber : 0;
-  const uri = vscode.Uri.joinPath(rootUri, entry.file);
-  const pos = new vscode.Position(ln, 0);
-  return new vscode.Location(uri, pos);
+  return new vscode.Location(getFileUri(entry.file), new vscode.Position(ln, 0));
 }
 
 function entryToSymbolKind(kind: string): vscode.SymbolKind {
@@ -418,7 +430,8 @@ async function loadTags(progress?: vscode.Progress<{ message?: string; increment
     logInfo(`  Sorted array: ${newDb.sorted.length} entries`);
     logInfo(`  Index build took ${formatDuration(indexTime)}`);
 
-    // Commit
+    // Commit — clear caches before swapping
+    fileUriCache.clear();
     db = newDb;
 
     // Summary
@@ -473,7 +486,7 @@ class CtagsDefinitionProvider implements vscode.DefinitionProvider {
     // Lazy-resolve line numbers before navigating
     await resolveEntries(entries, wsRootUri);
     logInfo(`Definition lookup: "${word}" -> ${entries.length} result(s)`);
-    return entries.map((e) => entryToLocation(e, wsRootUri));
+    return entries.map((e) => entryToLocation(e));
   }
 }
 
@@ -501,44 +514,50 @@ class CtagsHoverProvider implements vscode.HoverProvider {
 }
 
 class CtagsWorkspaceSymbolProvider implements vscode.WorkspaceSymbolProvider {
-  provideWorkspaceSymbols(query: string): vscode.SymbolInformation[] {
+  provideWorkspaceSymbols(query: string, _token: vscode.CancellationToken): vscode.SymbolInformation[] {
     const t = performance.now();
-    const limit = 500;
-    const lowerQuery = query.toLowerCase();
-
-    let results: CtagsEntry[];
+    const limit = 200;
+    const lowerQuery = query.toLowerCase().trim();
 
     if (lowerQuery.length === 0) {
-      // No query: return first N entries
-      results = db.entries.slice(0, limit);
-    } else {
-      // Try prefix search first (O(log n + k))
-      results = prefixSearch(db, lowerQuery, limit);
-
-      // If prefix didn't fill up, supplement with substring matches
-      if (results.length < limit) {
-        const prefixSet = new Set(results);
-        const substringResults = substringSearch(db, lowerQuery, limit);
-        for (const entry of substringResults) {
-          if (!prefixSet.has(entry)) {
-            results.push(entry);
-            if (results.length >= limit) { break; }
-          }
-        }
-      }
+      return [];
     }
 
-    const symbols = results.map(entry =>
-      new vscode.SymbolInformation(
-        entry.name,
-        entryToSymbolKind(entry.kind),
-        entry.scope,
-        entryToLocation(entry, wsRootUri),
-      ),
-    );
+    try {
+      // Fast prefix search via binary search — O(log n + k), synchronous
+      const results = prefixSearch(db, lowerQuery, limit);
 
-    logInfo(`Workspace symbol search: "${query}" -> ${symbols.length} result(s) in ${formatDuration(performance.now() - t)}`);
-    return symbols;
+      const symbols = results.map(entry =>
+        new vscode.SymbolInformation(
+          entry.name,
+          entryToSymbolKind(entry.kind),
+          entry.scope,
+          entryToLocation(entry),
+        ),
+      );
+
+      logInfo(`Workspace symbol search: "${query}" -> ${symbols.length} result(s) in ${formatDuration(performance.now() - t)}`);
+      return symbols;
+    } catch (err) {
+      logError(`Workspace symbol search failed for "${query}": ${err}`);
+      return [];
+    }
+  }
+
+  async resolveWorkspaceSymbol(symbol: vscode.SymbolInformation): Promise<vscode.SymbolInformation | undefined> {
+    // Resolve the exact line number when the user selects a symbol
+    const relPath = vscode.workspace.asRelativePath(symbol.location.uri, false);
+    const entries = db.nameIndex.get(symbol.name);
+    if (!entries) { return symbol; }
+
+    const match = entries.find(e => e.file === relPath);
+    if (match) {
+      if (match.lineNumber === -1) {
+        await resolveLineNumber(match, wsRootUri);
+      }
+      symbol.location = entryToLocation(match);
+    }
+    return symbol;
   }
 }
 
@@ -561,7 +580,7 @@ class CtagsDocumentSymbolProvider implements vscode.DocumentSymbolProvider {
         entry.name,
         entryToSymbolKind(entry.kind),
         entry.scope,
-        entryToLocation(entry, wsRootUri),
+        entryToLocation(entry),
       ),
     );
 
@@ -581,7 +600,7 @@ class CtagsReferenceProvider implements vscode.ReferenceProvider {
     if (!entries || entries.length === 0) { return undefined; }
     await resolveEntries(entries, wsRootUri);
     logInfo(`References lookup: "${word}" -> ${entries.length} result(s)`);
-    return entries.map((e) => entryToLocation(e, wsRootUri));
+    return entries.map((e) => entryToLocation(e));
   }
 }
 
@@ -655,6 +674,7 @@ export function activate(context: vscode.ExtensionContext) {
     if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = undefined; }
     logInfo("Tags file deleted.");
     db = { entries: [], nameIndex: new Map(), fileIndex: new Map(), sorted: [] };
+    fileUriCache.clear();
     updateStatusBar();
     vscode.window.showInformationMessage("[vsctags] Tags file removed.");
   });
