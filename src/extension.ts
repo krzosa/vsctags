@@ -1,6 +1,5 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import * as fs from "fs/promises";
 import { createReadStream } from "fs";
 import * as readline from "readline";
 
@@ -239,19 +238,15 @@ function substringSearch(db: TagDatabase, query: string, limit: number): CtagsEn
 
 // ---- Lazy line number resolution ----
 
-/** Cache of file contents for lazy resolution, keyed by absolute path */
-const fileContentCache = new Map<string, string[] | null>();
-
-async function getFileLines(absPath: string): Promise<string[] | null> {
-  const cached = fileContentCache.get(absPath);
-  if (cached !== undefined) { return cached; }
+/**
+ * Get file contents via VS Code's document model.
+ * Uses already-loaded buffers when available, picks up unsaved changes,
+ * and lets VS Code manage its own caching — no duplicate memory usage.
+ */
+async function getDocument(uri: vscode.Uri): Promise<vscode.TextDocument | null> {
   try {
-    const content = await fs.readFile(absPath, "utf-8");
-    const lines = content.split("\n");
-    fileContentCache.set(absPath, lines);
-    return lines;
+    return await vscode.workspace.openTextDocument(uri);
   } catch {
-    fileContentCache.set(absPath, null);
     return null;
   }
 }
@@ -260,7 +255,7 @@ async function getFileLines(absPath: string): Promise<string[] | null> {
  * Resolve the line number of an entry lazily. If already resolved, returns immediately.
  * Otherwise reads the source file (with caching) and finds the pattern.
  */
-async function resolveLineNumber(entry: CtagsEntry, root: string): Promise<number> {
+async function resolveLineNumber(entry: CtagsEntry, rootUri: vscode.Uri): Promise<number> {
   if (entry.lineNumber >= 0) { return entry.lineNumber; }
 
   const searchText = extractSearchText(entry.pattern);
@@ -269,15 +264,14 @@ async function resolveLineNumber(entry: CtagsEntry, root: string): Promise<numbe
     return 0;
   }
 
-  const absPath = path.join(root, entry.file);
-  const lines = await getFileLines(absPath);
-  if (!lines) {
+  const doc = await getDocument(vscode.Uri.joinPath(rootUri, entry.file));
+  if (!doc) {
     entry.lineNumber = 0;
     return 0;
   }
 
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].includes(searchText)) {
+  for (let i = 0; i < doc.lineCount; i++) {
+    if (doc.lineAt(i).text.includes(searchText)) {
       entry.lineNumber = i;
       return i;
     }
@@ -288,34 +282,18 @@ async function resolveLineNumber(entry: CtagsEntry, root: string): Promise<numbe
 
 /**
  * Resolve line numbers for a batch of entries.
- * Groups by file to avoid redundant reads.
  */
-async function resolveEntries(entries: CtagsEntry[], root: string): Promise<void> {
-  // Collect unique files that need resolution
-  const filesToResolve = new Set<string>();
+async function resolveEntries(entries: CtagsEntry[], rootUri: vscode.Uri): Promise<void> {
   for (const e of entries) {
     if (e.lineNumber === -1) {
-      filesToResolve.add(e.file);
-    }
-  }
-  // Pre-load files in parallel (up to 20 at a time)
-  const files = Array.from(filesToResolve);
-  const batchSize = 20;
-  for (let i = 0; i < files.length; i += batchSize) {
-    const batch = files.slice(i, i + batchSize);
-    await Promise.all(batch.map(f => getFileLines(path.join(root, f))));
-  }
-  // Now resolve all entries (file contents are cached)
-  for (const e of entries) {
-    if (e.lineNumber === -1) {
-      await resolveLineNumber(e, root);
+      await resolveLineNumber(e, rootUri);
     }
   }
 }
 
-function entryToLocation(entry: CtagsEntry, root: string): vscode.Location {
+function entryToLocation(entry: CtagsEntry, rootUri: vscode.Uri): vscode.Location {
   const ln = entry.lineNumber >= 0 ? entry.lineNumber : 0;
-  const uri = vscode.Uri.file(path.join(root, entry.file));
+  const uri = vscode.Uri.joinPath(rootUri, entry.file);
   const pos = new vscode.Position(ln, 0);
   return new vscode.Location(uri, pos);
 }
@@ -371,6 +349,7 @@ function formatDuration(ms: number): string {
 
 let db: TagDatabase = { entries: [], nameIndex: new Map(), fileIndex: new Map(), sorted: [] };
 let wsRoot = "";
+let wsRootUri: vscode.Uri;
 let statusBarItem: vscode.StatusBarItem;
 let isLoading = false;
 
@@ -404,13 +383,13 @@ async function loadTags(progress?: vscode.Progress<{ message?: string; increment
 
   try {
     // Stage 1: Stream-parse the file
-    logInfo("Stage 1/3: Stream-parsing tags file...");
+    logInfo("Stage 1/2: Stream-parsing tags file...");
     const t1 = performance.now();
 
     let fileSizeKB = "?";
     let fileSizeBytes = 0;
     try {
-      const stat = await fs.stat(tagsPath);
+      const stat = await vscode.workspace.fs.stat(vscode.Uri.file(tagsPath));
       fileSizeBytes = stat.size;
       fileSizeKB = (fileSizeBytes / 1024).toFixed(1);
       logInfo(`  File size: ${fileSizeKB} KB`);
@@ -428,7 +407,7 @@ async function loadTags(progress?: vscode.Progress<{ message?: string; increment
     logInfo(`  ${withLineNum} with line numbers, ${needsResolve} need lazy resolution`);
 
     // Stage 2: Build indexes (name, file, sorted)
-    logInfo("Stage 2/3: Building indexes...");
+    logInfo("Stage 2/2: Building indexes...");
     if (progress) { progress.report({ message: `Building index for ${entries.length} tags...` }); }
     statusBarItem.text = `$(sync~spin) vsctags: indexing...`;
     const t2 = performance.now();
@@ -438,10 +417,6 @@ async function loadTags(progress?: vscode.Progress<{ message?: string; increment
     logInfo(`  File index: ${newDb.fileIndex.size} files`);
     logInfo(`  Sorted array: ${newDb.sorted.length} entries`);
     logInfo(`  Index build took ${formatDuration(indexTime)}`);
-
-    // Stage 3: Clear file content cache (stale data from previous load)
-    logInfo("Stage 3/3: Clearing resolution cache...");
-    fileContentCache.clear();
 
     // Commit
     db = newDb;
@@ -496,9 +471,9 @@ class CtagsDefinitionProvider implements vscode.DefinitionProvider {
     const entries = db.nameIndex.get(word);
     if (!entries || entries.length === 0) { return undefined; }
     // Lazy-resolve line numbers before navigating
-    await resolveEntries(entries, wsRoot);
+    await resolveEntries(entries, wsRootUri);
     logInfo(`Definition lookup: "${word}" -> ${entries.length} result(s)`);
-    return entries.map((e) => entryToLocation(e, wsRoot));
+    return entries.map((e) => entryToLocation(e, wsRootUri));
   }
 }
 
@@ -511,7 +486,7 @@ class CtagsHoverProvider implements vscode.HoverProvider {
     if (!word) { return undefined; }
     const entries = db.nameIndex.get(word);
     if (!entries || entries.length === 0) { return undefined; }
-    await resolveEntries(entries, wsRoot);
+    await resolveEntries(entries, wsRootUri);
 
     const lines: string[] = [];
     for (const entry of entries) {
@@ -558,7 +533,7 @@ class CtagsWorkspaceSymbolProvider implements vscode.WorkspaceSymbolProvider {
         entry.name,
         entryToSymbolKind(entry.kind),
         entry.scope,
-        entryToLocation(entry, wsRoot),
+        entryToLocation(entry, wsRootUri),
       ),
     );
 
@@ -586,7 +561,7 @@ class CtagsDocumentSymbolProvider implements vscode.DocumentSymbolProvider {
         entry.name,
         entryToSymbolKind(entry.kind),
         entry.scope,
-        entryToLocation(entry, wsRoot),
+        entryToLocation(entry, wsRootUri),
       ),
     );
 
@@ -604,9 +579,9 @@ class CtagsReferenceProvider implements vscode.ReferenceProvider {
     if (!word) { return undefined; }
     const entries = db.nameIndex.get(word);
     if (!entries || entries.length === 0) { return undefined; }
-    await resolveEntries(entries, wsRoot);
+    await resolveEntries(entries, wsRootUri);
     logInfo(`References lookup: "${word}" -> ${entries.length} result(s)`);
-    return entries.map((e) => entryToLocation(e, wsRoot));
+    return entries.map((e) => entryToLocation(e, wsRootUri));
   }
 }
 
@@ -623,7 +598,8 @@ export function activate(context: vscode.ExtensionContext) {
     logInfo("No workspace folder open. Extension idle.");
     return;
   }
-  wsRoot = folders[0].uri.fsPath;
+  wsRootUri = folders[0].uri;
+  wsRoot = wsRootUri.fsPath;
   logInfo(`Workspace root: ${wsRoot}`);
 
   // Status bar
@@ -679,7 +655,6 @@ export function activate(context: vscode.ExtensionContext) {
     if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = undefined; }
     logInfo("Tags file deleted.");
     db = { entries: [], nameIndex: new Map(), fileIndex: new Map(), sorted: [] };
-    fileContentCache.clear();
     updateStatusBar();
     vscode.window.showInformationMessage("[vsctags] Tags file removed.");
   });
@@ -715,5 +690,4 @@ export function activate(context: vscode.ExtensionContext) {
 
 export function deactivate() {
   logInfo("Extension deactivated.");
-  fileContentCache.clear();
 }
