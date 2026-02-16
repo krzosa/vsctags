@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import { createReadStream, readFileSync } from "fs";
+import { createReadStream } from "fs";
 import * as readline from "readline";
 
 // ---- Output Channel for observability ----
@@ -746,7 +746,7 @@ export function activate(context: vscode.ExtensionContext) {
 
 // ---- Welcome Page ----
 
-function showWelcomePage(context: vscode.ExtensionContext) {
+async function showWelcomePage(context: vscode.ExtensionContext) {
   const panel = vscode.window.createWebviewPanel(
     "vsctags.welcome",
     "vsctags — Welcome",
@@ -756,8 +756,20 @@ function showWelcomePage(context: vscode.ExtensionContext) {
 
   let markdown = "";
   try {
-    const readmePath = path.join(context.extensionPath, "README.md");
-    markdown = readFileSync(readmePath, "utf-8");
+    // Try both cases — vsce may lowercase the filename in the VSIX
+    let bytes: Uint8Array | undefined;
+    for (const name of ["README.md", "readme.md"]) {
+      try {
+        bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(context.extensionUri, name));
+        break;
+      } catch { /* try next */ }
+    }
+    if (bytes) {
+      markdown = Buffer.from(bytes).toString("utf-8");
+    } else {
+      logError(`README not found at extensionUri: ${context.extensionUri.toString()}`);
+      markdown = "# vsctags\n\nREADME.md not found.";
+    }
   } catch {
     markdown = "# vsctags\n\nREADME.md not found.";
   }
