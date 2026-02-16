@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import { createReadStream } from "fs";
+import { createReadStream, readFileSync } from "fs";
 import * as readline from "readline";
 
 // ---- Output Channel for observability ----
@@ -727,7 +727,203 @@ export function activate(context: vscode.ExtensionContext) {
     }),
   );
 
+  // Welcome page command
+  context.subscriptions.push(
+    vscode.commands.registerCommand("vsctags.showWelcome", () => {
+      showWelcomePage(context);
+    }),
+  );
+
+  // Auto-show welcome page on first install
+  const hasShownWelcome = context.globalState.get<boolean>("vsctags.welcomeShown");
+  if (!hasShownWelcome) {
+    showWelcomePage(context);
+    context.globalState.update("vsctags.welcomeShown", true);
+  }
+
   logInfo("Extension activated.");
+}
+
+// ---- Welcome Page ----
+
+function showWelcomePage(context: vscode.ExtensionContext) {
+  const panel = vscode.window.createWebviewPanel(
+    "vsctags.welcome",
+    "vsctags — Welcome",
+    vscode.ViewColumn.One,
+    { enableScripts: false },
+  );
+
+  let markdown = "";
+  try {
+    const readmePath = path.join(context.extensionPath, "README.md");
+    markdown = readFileSync(readmePath, "utf-8");
+  } catch {
+    markdown = "# vsctags\n\nREADME.md not found.";
+  }
+
+  panel.webview.html = renderMarkdownHtml(markdown);
+}
+
+/** Minimal Markdown to HTML renderer — no dependencies */
+function renderMarkdownHtml(md: string): string {
+  let html = escapeHtml(md);
+
+  // Code blocks (``` ... ```)
+  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_m, lang, code) => {
+    return `<pre><code class="language-${lang}">${code.trim()}</code></pre>`;
+  });
+
+  // Inline code
+  html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+
+  // Tables
+  html = html.replace(/((?:^\|.+\|\s*$\n?)+)/gm, (_m, table: string) => {
+    const rows = table.trim().split("\n").filter(r => r.trim().length > 0);
+    if (rows.length < 2) { return table; }
+
+    // Check if second row is separator (|---|---|)
+    const isSep = /^\|[\s\-:|]+\|$/.test(rows[1].trim());
+    if (!isSep) { return table; }
+
+    const parseRow = (row: string) =>
+      row.split("|").slice(1, -1).map(c => c.trim());
+
+    const headerCells = parseRow(rows[0]);
+    const thead = "<tr>" + headerCells.map(c => `<th>${c}</th>`).join("") + "</tr>";
+
+    const bodyRows = rows.slice(2).map(row => {
+      const cells = parseRow(row);
+      return "<tr>" + cells.map(c => `<td>${c}</td>`).join("") + "</tr>";
+    }).join("\n");
+
+    return `<table><thead>${thead}</thead><tbody>${bodyRows}</tbody></table>`;
+  });
+
+  // Headers
+  html = html.replace(/^######\s+(.+)$/gm, "<h6>$1</h6>");
+  html = html.replace(/^#####\s+(.+)$/gm, "<h5>$1</h5>");
+  html = html.replace(/^####\s+(.+)$/gm, "<h4>$1</h4>");
+  html = html.replace(/^###\s+(.+)$/gm, "<h3>$1</h3>");
+  html = html.replace(/^##\s+(.+)$/gm, "<h2>$1</h2>");
+  html = html.replace(/^#\s+(.+)$/gm, "<h1>$1</h1>");
+
+  // Bold + italic
+  html = html.replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>");
+  html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
+
+  // Links
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+
+  // Unordered lists
+  html = html.replace(/((?:^- .+$\n?)+)/gm, (_m, block: string) => {
+    const items = block.trim().split("\n").map(l => `<li>${l.replace(/^- /, "")}</li>`);
+    return `<ul>${items.join("\n")}</ul>`;
+  });
+
+  // Ordered lists
+  html = html.replace(/((?:^\d+\.\s.+$\n?)+)/gm, (_m, block: string) => {
+    const items = block.trim().split("\n").map(l => `<li>${l.replace(/^\d+\.\s/, "")}</li>`);
+    return `<ol>${items.join("\n")}</ol>`;
+  });
+
+  // Horizontal rules
+  html = html.replace(/^---$/gm, "<hr>");
+
+  // Paragraphs — wrap remaining loose lines
+  html = html.replace(/^(?!<[a-z])(\S.+)$/gm, "<p>$1</p>");
+
+  // Clean up empty lines
+  html = html.replace(/\n{3,}/g, "\n\n");
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body {
+      font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif);
+      font-size: var(--vscode-font-size, 14px);
+      color: var(--vscode-foreground);
+      background: var(--vscode-editor-background);
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 24px;
+      line-height: 1.6;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      color: var(--vscode-foreground);
+      border-bottom: 1px solid var(--vscode-panel-border, #333);
+      padding-bottom: 4px;
+      margin-top: 24px;
+    }
+    h1 { font-size: 2em; }
+    h2 { font-size: 1.5em; }
+    h3 { font-size: 1.25em; }
+    code {
+      font-family: var(--vscode-editor-font-family, 'Menlo', 'Consolas', monospace);
+      background: var(--vscode-textCodeBlock-background, rgba(128,128,128,0.15));
+      padding: 2px 5px;
+      border-radius: 3px;
+      font-size: 0.9em;
+    }
+    pre {
+      background: var(--vscode-textCodeBlock-background, rgba(128,128,128,0.15));
+      padding: 12px 16px;
+      border-radius: 4px;
+      overflow-x: auto;
+    }
+    pre code {
+      background: none;
+      padding: 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 16px 0;
+    }
+    th, td {
+      border: 1px solid var(--vscode-panel-border, #444);
+      padding: 8px 12px;
+      text-align: left;
+    }
+    th {
+      background: var(--vscode-textCodeBlock-background, rgba(128,128,128,0.15));
+      font-weight: 600;
+    }
+    a {
+      color: var(--vscode-textLink-foreground, #3794ff);
+      text-decoration: none;
+    }
+    a:hover {
+      text-decoration: underline;
+    }
+    ul, ol {
+      padding-left: 24px;
+    }
+    li {
+      margin: 4px 0;
+    }
+    hr {
+      border: none;
+      border-top: 1px solid var(--vscode-panel-border, #333);
+      margin: 24px 0;
+    }
+  </style>
+</head>
+<body>
+${html}
+</body>
+</html>`;
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 export function deactivate() {
